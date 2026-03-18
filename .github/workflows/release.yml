@@ -48,25 +48,21 @@ jobs:
             goarch: amd64
             binary: patolake-linux-amd64
             cc: gcc
-            extldflags: "-static"
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             binary: patolake-linux-arm64
             cc: gcc
-            extldflags: "-static"
           - runner: macos-latest
             goos: darwin
             goarch: amd64
             binary: patolake-darwin-amd64
             cc: "clang -arch x86_64"
-            extldflags: ""
           - runner: macos-latest
             goos: darwin
             goarch: arm64
             binary: patolake-darwin-arm64
             cc: clang
-            extldflags: ""
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -90,11 +86,17 @@ jobs:
           DATE: ${{ github.event.head_commit.timestamp }}
         run: |
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${DATE}"
-          if [ -n "${{ matrix.extldflags }}" ]; then
-            LDFLAGS="${LDFLAGS} -extldflags '${{ matrix.extldflags }}'"
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            LDFLAGS="${LDFLAGS} -linkmode external -extldflags '-static'"
           fi
           CC="${{ matrix.cc }}" CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -ldflags "${LDFLAGS}" -o dist/${{ matrix.binary }} .
+
+      - name: Verify static linking
+        if: matrix.goos == 'linux'
+        run: |
+          file dist/${{ matrix.binary }}
+          ! ldd dist/${{ matrix.binary }} 2>/dev/null || echo "WARNING: binary is dynamically linked"
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v4
