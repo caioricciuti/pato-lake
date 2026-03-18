@@ -47,18 +47,22 @@ jobs:
             goos: linux
             goarch: amd64
             binary: patolake-linux-amd64
+            cc: gcc
           - runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             binary: patolake-linux-arm64
-          - runner: macos-13
+            cc: gcc
+          - runner: macos-latest
             goos: darwin
             goarch: amd64
             binary: patolake-darwin-amd64
+            cc: "clang -arch x86_64"
           - runner: macos-latest
             goos: darwin
             goarch: arm64
             binary: patolake-darwin-arm64
+            cc: clang
     runs-on: ${{ matrix.runner }}
     steps:
       - name: Checkout
@@ -82,7 +86,7 @@ jobs:
           DATE: ${{ github.event.head_commit.timestamp }}
         run: |
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${DATE}"
-          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+          CC="${{ matrix.cc }}" CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
             go build -trimpath -ldflags "${LDFLAGS}" -o dist/${{ matrix.binary }} .
 
       - name: Upload binary artifact
