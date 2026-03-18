@@ -14,7 +14,7 @@ RUN bun run build
 FROM golang:1.25-alpine AS go-builder
 WORKDIR /src
 
-RUN apk add --no-cache gcc musl-dev
+RUN apk add --no-cache gcc g++ musl-dev
 
 ARG VERSION=dev
 ARG COMMIT=none
