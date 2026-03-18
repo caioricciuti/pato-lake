@@ -1,0 +1,73 @@
+name: Bug Report
+description: Found something that doesn't work as expected?
+body:
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      description: What OS are you running Patolake on?
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Other
+    validations:
+      required: true
+  - type: dropdown
+    id: arch
+    attributes:
+      label: Architecture
+      description: What architecture?
+      options:
+        - x86_64 (amd64)
+        - ARM64 (aarch64 / Apple Silicon)
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How did you encounter the bug?
+      description: How can this bug be reproduced? Please provide steps to reproduce.
+      placeholder: |-
+        1. Start Patolake with...
+        2. Go to...
+        3. Click on...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      description: What was supposed to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual Result
+      description: What actually happened?
+    validations:
+      required: true
+  - type: textarea
+    id: version
+    attributes:
+      label: Version
+      description: What version of Patolake are you using?
+      placeholder: e.g. 2.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs / Error Output
+      description: Any relevant logs or error messages from the terminal?
+      render: shell
+    validations:
+      required: false
+  - type: markdown
+    attributes:
+      value: |-
+        ### All done, now, just submit the issue and I will do my best to take care of it!
+    validations:
+      required: false

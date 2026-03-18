@@ -1,0 +1,67 @@
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependencies
+node_modules
+
+# Build output
+dist/
+dist-ssr
+*.local
+.claude
+
+# Frontend build output (embedded into Go binary)
+ui/dist/
+!ui/dist/.gitkeep
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment
+.env
+.env.local
+!.env.example
+
+# Docker local data
+.clickhouse_local_data
+
+# SQLite database
+/data
+*.db
+*.db-shm
+*.db-wal
+
+
+# Go binary (built by Makefile)
+patolake
+
+.claude
+
+
+.gocache/
+
+# License tool secrets
+license/private.pem
+license/*.json
+license/*.log
+license/go.*
+license/licensetool
+license/README.md
+license/main.go
+
+posts.md
+patolake-server.pid
+CLAUDE.md

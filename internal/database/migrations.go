@@ -1,0 +1,1009 @@
+package database
+
+import (
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/google/uuid"
+)
+
+func (db *DB) runMigrations() error {
+	slog.Info("Running database migrations...")
+
+	stmts := []string{
+		// Installation settings (key-value store)
+		`CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Users (local auth)
+		`CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			username TEXT UNIQUE NOT NULL,
+			password_hash TEXT NOT NULL,
+			role TEXT NOT NULL DEFAULT 'viewer',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+		)`,
+
+		// Sessions (no connection_id, references users)
+		`CREATE TABLE IF NOT EXISTS sessions (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			token TEXT UNIQUE NOT NULL,
+			user_id TEXT NOT NULL REFERENCES users(id),
+			username TEXT NOT NULL,
+			user_role TEXT NOT NULL DEFAULT 'viewer',
+			created_at TEXT NOT NULL DEFAULT (datetime('now')),
+			expires_at TEXT NOT NULL
+		)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_session_token ON sessions(token)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_user ON sessions(user_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_session_expires ON sessions(expires_at)`,
+
+		// Rate limits
+		`CREATE TABLE IF NOT EXISTS rate_limits (
+			identifier TEXT PRIMARY KEY,
+			type TEXT NOT NULL,
+			attempts INTEGER NOT NULL DEFAULT 0,
+			first_attempt_at TEXT NOT NULL,
+			locked_until TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_rate_limit_type ON rate_limits(type)`,
+		`CREATE INDEX IF NOT EXISTS idx_rate_limit_locked ON rate_limits(locked_until)`,
+
+		// User role overrides
+		`CREATE TABLE IF NOT EXISTS user_roles (
+			username TEXT PRIMARY KEY,
+			role TEXT NOT NULL DEFAULT 'viewer',
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Saved queries (no connection_id)
+		`CREATE TABLE IF NOT EXISTS saved_queries (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT,
+			query TEXT NOT NULL,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Dashboards
+		`CREATE TABLE IF NOT EXISTS dashboards (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Dashboard panels (no connection_id)
+		`CREATE TABLE IF NOT EXISTS panels (
+			id TEXT PRIMARY KEY,
+			dashboard_id TEXT NOT NULL REFERENCES dashboards(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			panel_type TEXT NOT NULL DEFAULT 'table',
+			query TEXT NOT NULL,
+			config TEXT DEFAULT '{}',
+			layout_x INTEGER DEFAULT 0,
+			layout_y INTEGER DEFAULT 0,
+			layout_w INTEGER DEFAULT 6,
+			layout_h INTEGER DEFAULT 4,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_panel_dashboard ON panels(dashboard_id)`,
+
+		// Schedules (no connection_id)
+		`CREATE TABLE IF NOT EXISTS schedules (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			saved_query_id TEXT REFERENCES saved_queries(id) ON DELETE CASCADE,
+			cron TEXT NOT NULL,
+			timezone TEXT DEFAULT 'UTC',
+			enabled INTEGER DEFAULT 1,
+			timeout_ms INTEGER DEFAULT 60000,
+			last_run_at TEXT,
+			next_run_at TEXT,
+			last_status TEXT,
+			last_error TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Schedule runs
+		`CREATE TABLE IF NOT EXISTS schedule_runs (
+			id TEXT PRIMARY KEY,
+			schedule_id TEXT NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			status TEXT NOT NULL,
+			rows_affected INTEGER DEFAULT 0,
+			elapsed_ms INTEGER DEFAULT 0,
+			error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_sched_run_schedule ON schedule_runs(schedule_id)`,
+
+		// Audit logs
+		`CREATE TABLE IF NOT EXISTS audit_logs (
+			id TEXT PRIMARY KEY,
+			action TEXT NOT NULL,
+			username TEXT,
+			details TEXT,
+			ip_address TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at)`,
+
+		// Brain providers (admin-managed)
+		`CREATE TABLE IF NOT EXISTS brain_providers (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			base_url TEXT,
+			encrypted_api_key TEXT,
+			is_active INTEGER DEFAULT 1,
+			is_default INTEGER DEFAULT 0,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_provider_active ON brain_providers(is_active)`,
+
+		// Brain models by provider
+		`CREATE TABLE IF NOT EXISTS brain_models (
+			id TEXT PRIMARY KEY,
+			provider_id TEXT NOT NULL REFERENCES brain_providers(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			display_name TEXT,
+			is_active INTEGER DEFAULT 1,
+			is_default INTEGER DEFAULT 0,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(provider_id, name)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_model_provider ON brain_models(provider_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_model_active ON brain_models(is_active)`,
+
+		// Brain chats (no connection_id)
+		`CREATE TABLE IF NOT EXISTS brain_chats (
+			id TEXT PRIMARY KEY,
+			username TEXT NOT NULL,
+			title TEXT NOT NULL,
+			provider_id TEXT REFERENCES brain_providers(id) ON DELETE SET NULL,
+			model_id TEXT REFERENCES brain_models(id) ON DELETE SET NULL,
+			archived INTEGER DEFAULT 0,
+			last_message_at TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_chat_user ON brain_chats(username)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_chat_lastmsg ON brain_chats(last_message_at)`,
+
+		// Brain messages
+		`CREATE TABLE IF NOT EXISTS brain_messages (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES brain_chats(id) ON DELETE CASCADE,
+			role TEXT NOT NULL,
+			content TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'complete',
+			error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_msg_chat ON brain_messages(chat_id, created_at)`,
+
+		// Brain artifacts
+		`CREATE TABLE IF NOT EXISTS brain_artifacts (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES brain_chats(id) ON DELETE CASCADE,
+			message_id TEXT REFERENCES brain_messages(id) ON DELETE SET NULL,
+			artifact_type TEXT NOT NULL,
+			title TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_artifact_chat ON brain_artifacts(chat_id, created_at)`,
+
+		// Brain tool call traces
+		`CREATE TABLE IF NOT EXISTS brain_tool_calls (
+			id TEXT PRIMARY KEY,
+			chat_id TEXT NOT NULL REFERENCES brain_chats(id) ON DELETE CASCADE,
+			message_id TEXT NOT NULL REFERENCES brain_messages(id) ON DELETE CASCADE,
+			tool_name TEXT NOT NULL,
+			input_json TEXT NOT NULL,
+			output_json TEXT NOT NULL,
+			status TEXT NOT NULL,
+			error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_tool_chat ON brain_tool_calls(chat_id, created_at)`,
+
+		// Brain skills (admin-managed system prompts)
+		`CREATE TABLE IF NOT EXISTS brain_skills (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			content TEXT NOT NULL,
+			is_active INTEGER DEFAULT 1,
+			is_default INTEGER DEFAULT 0,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_brain_skill_active ON brain_skills(is_active)`,
+
+		// ══════════════════════════════════════════════════════════════
+		// Governance tables (Pro feature)
+		// ══════════════════════════════════════════════════════════════
+
+		// Governance sync state (watermark tracking)
+		`CREATE TABLE IF NOT EXISTS gov_sync_state (
+			id TEXT PRIMARY KEY,
+			sync_type TEXT NOT NULL UNIQUE,
+			last_synced_at TEXT,
+			watermark TEXT,
+			status TEXT DEFAULT 'idle',
+			last_error TEXT,
+			row_count INTEGER DEFAULT 0,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Governance databases
+		`CREATE TABLE IF NOT EXISTS gov_databases (
+			id TEXT PRIMARY KEY,
+			name TEXT UNIQUE NOT NULL,
+			engine TEXT,
+			first_seen TEXT NOT NULL,
+			last_updated TEXT NOT NULL,
+			is_deleted INTEGER DEFAULT 0
+		)`,
+
+		// Governance tables
+		`CREATE TABLE IF NOT EXISTS gov_tables (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			table_name TEXT NOT NULL,
+			engine TEXT,
+			total_rows INTEGER DEFAULT 0,
+			total_bytes INTEGER DEFAULT 0,
+			first_seen TEXT NOT NULL,
+			last_updated TEXT NOT NULL,
+			is_deleted INTEGER DEFAULT 0,
+			UNIQUE(database_name, table_name)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_tbl_db ON gov_tables(database_name)`,
+
+		// Governance columns
+		`CREATE TABLE IF NOT EXISTS gov_columns (
+			id TEXT PRIMARY KEY,
+			database_name TEXT NOT NULL,
+			table_name TEXT NOT NULL,
+			column_name TEXT NOT NULL,
+			column_type TEXT NOT NULL,
+			column_position INTEGER DEFAULT 0,
+			default_kind TEXT,
+			default_expression TEXT,
+			comment TEXT,
+			first_seen TEXT NOT NULL,
+			last_updated TEXT NOT NULL,
+			is_deleted INTEGER DEFAULT 0,
+			UNIQUE(database_name, table_name, column_name)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_col_tbl ON gov_columns(database_name, table_name)`,
+
+		// Governance schema changes
+		`CREATE TABLE IF NOT EXISTS gov_schema_changes (
+			id TEXT PRIMARY KEY,
+			change_type TEXT NOT NULL,
+			database_name TEXT NOT NULL,
+			table_name TEXT,
+			column_name TEXT,
+			old_value TEXT,
+			new_value TEXT,
+			detected_at TEXT NOT NULL,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_schema_time ON gov_schema_changes(detected_at)`,
+
+		// Governance query log
+		`CREATE TABLE IF NOT EXISTS gov_query_log (
+			id TEXT PRIMARY KEY,
+			query_id TEXT UNIQUE NOT NULL,
+			username TEXT NOT NULL,
+			query_text TEXT NOT NULL,
+			query_kind TEXT,
+			event_time TEXT NOT NULL,
+			duration_ms INTEGER DEFAULT 0,
+			result_rows INTEGER DEFAULT 0,
+			tables_used TEXT,
+			is_error INTEGER DEFAULT 0,
+			error_message TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_qlog_time ON gov_query_log(event_time)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_qlog_user ON gov_query_log(username)`,
+
+		// Governance lineage edges
+		`CREATE TABLE IF NOT EXISTS gov_lineage_edges (
+			id TEXT PRIMARY KEY,
+			source_database TEXT NOT NULL,
+			source_table TEXT NOT NULL,
+			target_database TEXT NOT NULL,
+			target_table TEXT NOT NULL,
+			query_id TEXT,
+			username TEXT,
+			edge_type TEXT NOT NULL,
+			detected_at TEXT NOT NULL,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_lineage_src ON gov_lineage_edges(source_database, source_table)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_lineage_tgt ON gov_lineage_edges(target_database, target_table)`,
+
+		// Governance sensitivity tags
+		`CREATE TABLE IF NOT EXISTS gov_tags (
+			id TEXT PRIMARY KEY,
+			object_type TEXT NOT NULL,
+			database_name TEXT NOT NULL,
+			table_name TEXT NOT NULL,
+			column_name TEXT NOT NULL DEFAULT '',
+			tag TEXT NOT NULL,
+			tagged_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(object_type, database_name, table_name, column_name, tag)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_tag_obj ON gov_tags(database_name, table_name)`,
+
+		// Governance policies
+		`CREATE TABLE IF NOT EXISTS gov_policies (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT,
+			object_type TEXT NOT NULL,
+			object_database TEXT,
+			object_table TEXT,
+			object_column TEXT,
+			required_role TEXT,
+			severity TEXT DEFAULT 'warn',
+			enforcement_mode TEXT NOT NULL DEFAULT 'warn',
+			enabled INTEGER DEFAULT 1,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		// Governance policy violations
+		`CREATE TABLE IF NOT EXISTS gov_policy_violations (
+			id TEXT PRIMARY KEY,
+			policy_id TEXT NOT NULL REFERENCES gov_policies(id) ON DELETE CASCADE,
+			query_log_id TEXT,
+			username TEXT NOT NULL,
+			violation_detail TEXT,
+			severity TEXT NOT NULL,
+			detection_phase TEXT NOT NULL DEFAULT 'post_exec',
+			request_endpoint TEXT,
+			detected_at TEXT NOT NULL,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_violation_policy ON gov_policy_violations(policy_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_violation_time ON gov_policy_violations(detected_at)`,
+
+		// Governance object notes/comments (table/column level)
+		`CREATE TABLE IF NOT EXISTS gov_object_comments (
+			id TEXT PRIMARY KEY,
+			object_type TEXT NOT NULL,
+			database_name TEXT NOT NULL,
+			table_name TEXT NOT NULL,
+			column_name TEXT NOT NULL DEFAULT '',
+			comment_text TEXT NOT NULL,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_comment_obj ON gov_object_comments(object_type, database_name, table_name, column_name, created_at)`,
+
+		// Governance incidents (Collibra-style workflow, simplified)
+		`CREATE TABLE IF NOT EXISTS gov_incidents (
+			id TEXT PRIMARY KEY,
+			source_type TEXT NOT NULL DEFAULT 'manual',
+			source_ref TEXT,
+			dedupe_key TEXT,
+			title TEXT NOT NULL,
+			severity TEXT NOT NULL DEFAULT 'warn',
+			status TEXT NOT NULL DEFAULT 'open',
+			assignee TEXT,
+			details TEXT,
+			resolution_note TEXT,
+			occurrence_count INTEGER NOT NULL DEFAULT 1,
+			first_seen_at TEXT NOT NULL,
+			last_seen_at TEXT NOT NULL,
+			resolved_at TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_incident_status ON gov_incidents(status, severity, last_seen_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_incident_source ON gov_incidents(source_type, source_ref)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_incident_dedupe ON gov_incidents(dedupe_key, status)`,
+
+		`CREATE TABLE IF NOT EXISTS gov_incident_comments (
+			id TEXT PRIMARY KEY,
+			incident_id TEXT NOT NULL REFERENCES gov_incidents(id) ON DELETE CASCADE,
+			comment_text TEXT NOT NULL,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_gov_incident_comment_incident ON gov_incident_comments(incident_id, created_at)`,
+
+		// Alerting channels (SMTP/Resend/Brevo)
+		`CREATE TABLE IF NOT EXISTS alert_channels (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			channel_type TEXT NOT NULL,
+			config_encrypted TEXT NOT NULL,
+			is_active INTEGER DEFAULT 1,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_channel_active ON alert_channels(is_active)`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_alert_channel_name_unique ON alert_channels(name)`,
+
+		// Alert rules
+		`CREATE TABLE IF NOT EXISTS alert_rules (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			severity_min TEXT NOT NULL DEFAULT 'warn',
+			enabled INTEGER DEFAULT 1,
+			cooldown_seconds INTEGER DEFAULT 300,
+			max_attempts INTEGER DEFAULT 5,
+			subject_template TEXT,
+			body_template TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_rule_enabled ON alert_rules(enabled)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_rule_event ON alert_rules(event_type, enabled)`,
+
+		// Rule routes map rules to channels and recipients
+		`CREATE TABLE IF NOT EXISTS alert_rule_routes (
+			id TEXT PRIMARY KEY,
+			rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+			channel_id TEXT NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+			recipients_json TEXT NOT NULL,
+			is_active INTEGER DEFAULT 1,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_route_rule ON alert_rule_routes(rule_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_route_channel ON alert_rule_routes(channel_id)`,
+
+		// Per-route delivery policy (digest/escalation metadata)
+		`CREATE TABLE IF NOT EXISTS alert_route_policies (
+			route_id TEXT PRIMARY KEY REFERENCES alert_rule_routes(id) ON DELETE CASCADE,
+			delivery_mode TEXT NOT NULL DEFAULT 'immediate',
+			digest_window_minutes INTEGER NOT NULL DEFAULT 0,
+			escalation_channel_id TEXT REFERENCES alert_channels(id) ON DELETE SET NULL,
+			escalation_recipients_json TEXT,
+			escalation_after_failures INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_route_policy_delivery ON alert_route_policies(delivery_mode, digest_window_minutes)`,
+
+		// Alert events emitted by governance/scheduler/other subsystems
+		`CREATE TABLE IF NOT EXISTS alert_events (
+			id TEXT PRIMARY KEY,
+			event_type TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			title TEXT NOT NULL,
+			message TEXT NOT NULL,
+			payload_json TEXT,
+			fingerprint TEXT,
+			source_ref TEXT,
+			status TEXT NOT NULL DEFAULT 'new',
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			processed_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_event_status ON alert_events(status, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_event_type ON alert_events(event_type, created_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_event_fingerprint ON alert_events(fingerprint, created_at)`,
+
+		// Dispatch jobs generated from events and routes
+		`CREATE TABLE IF NOT EXISTS alert_dispatch_jobs (
+			id TEXT PRIMARY KEY,
+			event_id TEXT NOT NULL REFERENCES alert_events(id) ON DELETE CASCADE,
+			rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+			route_id TEXT NOT NULL REFERENCES alert_rule_routes(id) ON DELETE CASCADE,
+			channel_id TEXT NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+			status TEXT NOT NULL DEFAULT 'queued',
+			attempt_count INTEGER DEFAULT 0,
+			max_attempts INTEGER DEFAULT 5,
+			next_attempt_at TEXT NOT NULL,
+			last_error TEXT,
+			provider_message_id TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			sent_at TEXT
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_job_due ON alert_dispatch_jobs(status, next_attempt_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_job_event ON alert_dispatch_jobs(event_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_job_route ON alert_dispatch_jobs(route_id)`,
+
+		// Digest windows for routes configured in digest mode
+		`CREATE TABLE IF NOT EXISTS alert_route_digests (
+			id TEXT PRIMARY KEY,
+			route_id TEXT NOT NULL REFERENCES alert_rule_routes(id) ON DELETE CASCADE,
+			rule_id TEXT NOT NULL REFERENCES alert_rules(id) ON DELETE CASCADE,
+			channel_id TEXT NOT NULL REFERENCES alert_channels(id) ON DELETE CASCADE,
+			bucket_start TEXT NOT NULL,
+			bucket_end TEXT NOT NULL,
+			event_type TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			event_count INTEGER NOT NULL DEFAULT 0,
+			event_ids_json TEXT NOT NULL,
+			titles_json TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'collecting',
+			attempt_count INTEGER NOT NULL DEFAULT 0,
+			max_attempts INTEGER NOT NULL DEFAULT 5,
+			next_attempt_at TEXT NOT NULL,
+			last_error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			sent_at TEXT,
+			UNIQUE(route_id, bucket_start, event_type, severity)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_digest_due ON alert_route_digests(status, next_attempt_at, bucket_end)`,
+		`CREATE INDEX IF NOT EXISTS idx_alert_digest_route ON alert_route_digests(route_id, bucket_start)`,
+
+		// ══════════════════════════════════════════════════════════════
+		// Pipeline tables (data ingestion pipelines)
+		// ══════════════════════════════════════════════════════════════
+
+		// Pipeline definitions (no connection_id — DuckDB is embedded)
+		`CREATE TABLE IF NOT EXISTS pipelines (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT,
+			status TEXT NOT NULL DEFAULT 'draft',
+			config TEXT NOT NULL DEFAULT '{}',
+			created_by TEXT,
+			last_started_at TEXT,
+			last_stopped_at TEXT,
+			last_error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_status ON pipelines(status)`,
+
+		// Pipeline graph nodes (sources and sinks)
+		`CREATE TABLE IF NOT EXISTS pipeline_nodes (
+			id TEXT PRIMARY KEY,
+			pipeline_id TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+			node_type TEXT NOT NULL,
+			label TEXT NOT NULL,
+			position_x REAL NOT NULL DEFAULT 0,
+			position_y REAL NOT NULL DEFAULT 0,
+			config_encrypted TEXT NOT NULL DEFAULT '{}',
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_node_pipeline ON pipeline_nodes(pipeline_id)`,
+
+		// Pipeline graph edges (connections between nodes)
+		`CREATE TABLE IF NOT EXISTS pipeline_edges (
+			id TEXT PRIMARY KEY,
+			pipeline_id TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+			source_node_id TEXT NOT NULL REFERENCES pipeline_nodes(id) ON DELETE CASCADE,
+			target_node_id TEXT NOT NULL REFERENCES pipeline_nodes(id) ON DELETE CASCADE,
+			source_handle TEXT,
+			target_handle TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(pipeline_id, source_node_id, target_node_id)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_edge_pipeline ON pipeline_edges(pipeline_id)`,
+
+		// Pipeline execution runs
+		`CREATE TABLE IF NOT EXISTS pipeline_runs (
+			id TEXT PRIMARY KEY,
+			pipeline_id TEXT NOT NULL REFERENCES pipelines(id) ON DELETE CASCADE,
+			status TEXT NOT NULL DEFAULT 'running',
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			rows_ingested INTEGER DEFAULT 0,
+			bytes_ingested INTEGER DEFAULT 0,
+			errors_count INTEGER DEFAULT 0,
+			last_error TEXT,
+			metrics_json TEXT DEFAULT '{}',
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_run_pipeline ON pipeline_runs(pipeline_id)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_run_started ON pipeline_runs(pipeline_id, started_at)`,
+
+		// Pipeline run logs
+		`CREATE TABLE IF NOT EXISTS pipeline_run_logs (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL REFERENCES pipeline_runs(id) ON DELETE CASCADE,
+			level TEXT NOT NULL DEFAULT 'info',
+			message TEXT NOT NULL,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_pipeline_run_log_run ON pipeline_run_logs(run_id, created_at)`,
+
+		// ── Models (dbt-like SQL transformations) ─────────────────────────
+		`CREATE TABLE IF NOT EXISTS models (
+			id TEXT PRIMARY KEY,
+			name TEXT UNIQUE NOT NULL,
+			description TEXT DEFAULT '',
+			target_database TEXT NOT NULL DEFAULT 'main',
+			materialization TEXT NOT NULL DEFAULT 'view',
+			sql_body TEXT NOT NULL DEFAULT '',
+			table_engine TEXT NOT NULL DEFAULT '',
+			order_by TEXT NOT NULL DEFAULT '',
+			status TEXT NOT NULL DEFAULT 'draft',
+			last_error TEXT,
+			last_run_at TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS model_runs (
+			id TEXT PRIMARY KEY,
+			status TEXT NOT NULL DEFAULT 'running',
+			total_models INTEGER NOT NULL DEFAULT 0,
+			succeeded INTEGER NOT NULL DEFAULT 0,
+			failed INTEGER NOT NULL DEFAULT 0,
+			skipped INTEGER NOT NULL DEFAULT 0,
+			started_at TEXT NOT NULL,
+			finished_at TEXT,
+			triggered_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_model_run_started ON model_runs(started_at)`,
+
+		`CREATE TABLE IF NOT EXISTS model_run_results (
+			id TEXT PRIMARY KEY,
+			run_id TEXT NOT NULL REFERENCES model_runs(id) ON DELETE CASCADE,
+			model_id TEXT NOT NULL REFERENCES models(id) ON DELETE CASCADE,
+			model_name TEXT NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			resolved_sql TEXT,
+			elapsed_ms INTEGER DEFAULT 0,
+			error TEXT,
+			started_at TEXT,
+			finished_at TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_model_result_run ON model_run_results(run_id)`,
+
+		`CREATE TABLE IF NOT EXISTS model_schedules (
+			id TEXT PRIMARY KEY,
+			anchor_model_id TEXT REFERENCES models(id) ON DELETE CASCADE,
+			cron TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			last_run_at TEXT,
+			next_run_at TEXT,
+			last_status TEXT,
+			last_error TEXT,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(anchor_model_id)
+		)`,
+
+		// ══════════════════════════════════════════════════════════════
+		// API Keys (programmatic access)
+		// ══════════════════════════════════════════════════════════════
+		`CREATE TABLE IF NOT EXISTS api_keys (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			key_prefix TEXT NOT NULL,
+			key_hash TEXT NOT NULL UNIQUE,
+			role TEXT NOT NULL DEFAULT 'viewer',
+			scopes TEXT DEFAULT '*',
+			rate_limit_rpm INTEGER DEFAULT 60,
+			is_active INTEGER DEFAULT 1,
+			last_used_at TEXT,
+			expires_at TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_key_hash ON api_keys(key_hash)`,
+		`CREATE INDEX IF NOT EXISTS idx_api_key_user ON api_keys(user_id)`,
+
+		`CREATE TABLE IF NOT EXISTS api_key_usage (
+			id TEXT PRIMARY KEY,
+			api_key_id TEXT NOT NULL,
+			date TEXT NOT NULL,
+			request_count INTEGER DEFAULT 0,
+			query_count INTEGER DEFAULT 0,
+			ingest_events INTEGER DEFAULT 0,
+			ingest_bytes INTEGER DEFAULT 0,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(api_key_id, date)
+		)`,
+
+		// ══════════════════════════════════════════════════════════════
+		// Event Ingestion
+		// ══════════════════════════════════════════════════════════════
+		`CREATE TABLE IF NOT EXISTS ingest_sources (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL UNIQUE,
+			event_type TEXT NOT NULL UNIQUE,
+			target_schema TEXT DEFAULT 'main',
+			target_table TEXT,
+			buffer_size INTEGER DEFAULT 1000,
+			flush_interval_ms INTEGER DEFAULT 5000,
+			is_active INTEGER DEFAULT 1,
+			created_by TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+
+		`CREATE TABLE IF NOT EXISTS ingest_stats (
+			id TEXT PRIMARY KEY,
+			source_id TEXT NOT NULL,
+			date TEXT NOT NULL,
+			events_received INTEGER DEFAULT 0,
+			events_written INTEGER DEFAULT 0,
+			bytes_received INTEGER DEFAULT 0,
+			errors_count INTEGER DEFAULT 0,
+			last_error TEXT,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(source_id, date)
+		)`,
+
+		// ══════════════════════════════════════════════════════════════
+		// SQL Notebooks
+		// ══════════════════════════════════════════════════════════════
+		`CREATE TABLE IF NOT EXISTS notebooks (
+			id TEXT PRIMARY KEY,
+			title TEXT NOT NULL,
+			description TEXT DEFAULT '',
+			created_by TEXT NOT NULL,
+			is_public INTEGER DEFAULT 0,
+			share_token TEXT UNIQUE,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_notebook_user ON notebooks(created_by)`,
+
+		`CREATE TABLE IF NOT EXISTS notebook_cells (
+			id TEXT PRIMARY KEY,
+			notebook_id TEXT NOT NULL REFERENCES notebooks(id) ON DELETE CASCADE,
+			cell_type TEXT NOT NULL DEFAULT 'sql',
+			content TEXT NOT NULL DEFAULT '',
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+			updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_notebook_cell_pos ON notebook_cells(notebook_id, position)`,
+	}
+
+	for _, stmt := range stmts {
+		if _, err := db.conn.Exec(stmt); err != nil {
+			return err
+		}
+	}
+
+	// Migrate model_schedules: add anchor_model_id column if missing
+	if err := db.migrateModelSchedulesAnchor(); err != nil {
+		return fmt.Errorf("migrate model_schedules anchor: %w", err)
+	}
+
+	if err := db.ensureColumn("gov_policies", "enforcement_mode", "TEXT NOT NULL DEFAULT 'warn'"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("gov_policy_violations", "detection_phase", "TEXT NOT NULL DEFAULT 'post_exec'"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("gov_policy_violations", "request_endpoint", "TEXT"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("brain_chats", "context_database", "TEXT"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("brain_chats", "context_table", "TEXT"); err != nil {
+		return err
+	}
+	if err := db.ensureColumn("brain_chats", "context_tables", "TEXT"); err != nil {
+		return err
+	}
+
+	// Drop legacy tables from the old SaaS schema
+	dropLegacy := []string{
+		"DROP TABLE IF EXISTS organizations",
+		"DROP TABLE IF EXISTS tunnel_connections",
+		"DROP TABLE IF EXISTS cloud_sessions",
+		"DROP TABLE IF EXISTS scheduled_runs",
+		"DROP TABLE IF EXISTS scheduled_jobs",
+		"DROP TABLE IF EXISTS cloud_saved_queries",
+		"DROP TABLE IF EXISTS cloud_panels",
+		"DROP TABLE IF EXISTS cloud_dashboards",
+		"DROP TABLE IF EXISTS cloud_user_roles",
+		"DROP TABLE IF EXISTS beta_applications",
+		"DROP TABLE IF EXISTS cloud_audit_logs",
+		"DROP TABLE IF EXISTS connections",
+		// Drop legacy RBAC governance tables (replaced by Patolake role hierarchy)
+		"DROP TABLE IF EXISTS gov_access_matrix",
+		"DROP TABLE IF EXISTS gov_grants",
+		"DROP TABLE IF EXISTS gov_role_grants",
+		"DROP TABLE IF EXISTS gov_ch_roles",
+		"DROP TABLE IF EXISTS gov_ch_users",
+	}
+	for _, stmt := range dropLegacy {
+		if _, err := db.conn.Exec(stmt); err != nil {
+			slog.Warn("Failed to drop legacy table", "error", err)
+		}
+	}
+
+	// Seed installation_id if not present
+	var count int
+	if err := db.conn.QueryRow("SELECT COUNT(*) FROM settings WHERE key = 'installation_id'").Scan(&count); err == nil && count == 0 {
+		db.conn.Exec("INSERT INTO settings (key, value) VALUES ('installation_id', ?)", uuid.NewString())
+		slog.Info("Generated new installation ID")
+	}
+
+	// Seed default Brain skill if not present.
+	if err := db.conn.QueryRow("SELECT COUNT(*) FROM brain_skills").Scan(&count); err == nil && count == 0 {
+		now := "CURRENT_TIMESTAMP"
+		db.conn.Exec(`INSERT INTO brain_skills (id, name, content, is_active, is_default, created_by, created_at, updated_at)
+			VALUES (?, ?, ?, 1, 1, 'system', `+now+`, `+now+`)`,
+			uuid.NewString(),
+			"Default Brain Skill",
+			`You are Brain, a senior DuckDB copilot.
+
+Priorities:
+- Give correct SQL first, concise explanation second.
+- Keep queries safe and cost-aware: start with LIMIT 100 unless user asks otherwise.
+- Prefer explicit columns over SELECT * on large tables.
+- Use only schema fields known in context; if missing, ask a short clarifying question.
+- When uncertain, provide assumptions clearly.
+- Use DuckDB SQL syntax, functions, and features (e.g., list_agg, struct types, COPY TO/FROM, read_parquet, read_csv_auto).
+
+Artifacts:
+- When sharing SQL, return a runnable SQL block.
+- If a query result artifact exists, reference it by title and summarize key findings in bullets.
+- For follow-ups, reuse prior artifacts/chats when relevant.
+
+Tool behavior:
+- Read-only queries by default.
+- Never execute DROP/TRUNCATE/ALTER unless user explicitly asks and confirms.
+- For expensive requests, propose a lightweight preview query first.
+
+Formatting:
+1) One-line intent acknowledgment.
+2) SQL in a fenced sql block.
+3) Short explanation and optional next-step variants.`,
+		)
+	}
+
+	slog.Info("Database migrations completed")
+	return nil
+}
+
+// migrateModelSchedulesAnchor detects old model_schedules without anchor_model_id
+// and migrates data to the new schema.
+func (db *DB) migrateModelSchedulesAnchor() error {
+	// Check if anchor_model_id column already exists
+	rows, err := db.conn.Query("PRAGMA table_info(model_schedules)")
+	if err != nil {
+		return nil // table may not exist yet
+	}
+	defer rows.Close()
+
+	hasAnchor := false
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue interface{}
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return err
+		}
+		if strings.EqualFold(strings.TrimSpace(name), "anchor_model_id") {
+			hasAnchor = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	if hasAnchor {
+		return nil // already migrated
+	}
+
+	slog.Info("Migrating model_schedules to add anchor_model_id")
+
+	// Rename old table
+	if _, err := db.conn.Exec("ALTER TABLE model_schedules RENAME TO model_schedules_old"); err != nil {
+		return fmt.Errorf("rename old table: %w", err)
+	}
+
+	// Create new table
+	if _, err := db.conn.Exec(`CREATE TABLE model_schedules (
+		id TEXT PRIMARY KEY,
+		anchor_model_id TEXT REFERENCES models(id) ON DELETE CASCADE,
+		cron TEXT NOT NULL,
+		enabled INTEGER NOT NULL DEFAULT 1,
+		last_run_at TEXT,
+		next_run_at TEXT,
+		last_status TEXT,
+		last_error TEXT,
+		created_by TEXT,
+		created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+		updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+		UNIQUE(anchor_model_id)
+	)`); err != nil {
+		return fmt.Errorf("create new table: %w", err)
+	}
+
+	// Copy data with backfill: pick the first model by name as anchor
+	if _, err := db.conn.Exec(`INSERT INTO model_schedules
+		(id, anchor_model_id, cron, enabled, last_run_at, next_run_at,
+		 last_status, last_error, created_by, created_at, updated_at)
+		SELECT s.id,
+			(SELECT m.id FROM models m ORDER BY m.name ASC LIMIT 1),
+			s.cron, s.enabled, s.last_run_at, s.next_run_at,
+			s.last_status, s.last_error, s.created_by, s.created_at, s.updated_at
+		FROM model_schedules_old s`); err != nil {
+		return fmt.Errorf("copy data: %w", err)
+	}
+
+	// Drop old table
+	if _, err := db.conn.Exec("DROP TABLE model_schedules_old"); err != nil {
+		return fmt.Errorf("drop old table: %w", err)
+	}
+
+	// Delete orphaned schedules with no anchor
+	if _, err := db.conn.Exec("DELETE FROM model_schedules WHERE anchor_model_id IS NULL"); err != nil {
+		return fmt.Errorf("delete orphans: %w", err)
+	}
+
+	slog.Info("model_schedules migration complete")
+	return nil
+}
+
+func (db *DB) ensureColumn(tableName, columnName, definition string) error {
+	rows, err := db.conn.Query(fmt.Sprintf("PRAGMA table_info(%s)", tableName))
+	if err != nil {
+		return fmt.Errorf("inspect table %s columns: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var cid int
+		var name, colType string
+		var notNull, pk int
+		var dfltValue interface{}
+		if err := rows.Scan(&cid, &name, &colType, &notNull, &dfltValue, &pk); err != nil {
+			return fmt.Errorf("scan table info for %s: %w", tableName, err)
+		}
+		if strings.EqualFold(strings.TrimSpace(name), strings.TrimSpace(columnName)) {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate table info for %s: %w", tableName, err)
+	}
+
+	if _, err := db.conn.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", tableName, columnName, definition)); err != nil {
+		return fmt.Errorf("add column %s.%s: %w", tableName, columnName, err)
+	}
+
+	return nil
+}

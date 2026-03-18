@@ -1,0 +1,14 @@
+.git
+.github
+.claude
+.DS_Store
+patolake
+patolake-server.pid
+data
+dist
+tmp
+node_modules
+ui/node_modules
+ui/.svelte-kit
+ui/dist
+ui/.DS_Store
