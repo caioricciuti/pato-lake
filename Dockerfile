@@ -14,6 +14,8 @@ RUN bun run build
 FROM golang:1.25-alpine AS go-builder
 WORKDIR /src
 
+RUN apk add --no-cache gcc musl-dev
+
 ARG VERSION=dev
 ARG COMMIT=none
 ARG BUILD_DATE=unknown
@@ -26,7 +28,7 @@ RUN go mod download
 COPY . .
 COPY --from=ui-builder /src/ui/dist ./ui/dist
 
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
     go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" -o /out/patolake .
 
 FROM alpine:3.20 AS runtime

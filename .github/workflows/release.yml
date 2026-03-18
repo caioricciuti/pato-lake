@@ -18,16 +18,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
+  build-frontend:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.24'
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
@@ -35,22 +30,84 @@ jobs:
       - name: Build frontend
         run: make build-frontend
 
-      - name: Extract version
-        id: version
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+      - name: Upload frontend artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist/
+          retention-days: 1
 
-      - name: Cross-compile binaries
+  build-binary:
+    needs: build-frontend
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            binary: patolake-linux-amd64
+          - runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+            binary: patolake-linux-arm64
+          - runner: macos-13
+            goos: darwin
+            goarch: amd64
+            binary: patolake-darwin-amd64
+          - runner: macos-latest
+            goos: darwin
+            goarch: arm64
+            binary: patolake-darwin-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: ui/dist/
+
+      - name: Build binary
         env:
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ github.ref_name }}
           COMMIT: ${{ github.sha }}
           DATE: ${{ github.event.head_commit.timestamp }}
         run: |
           LDFLAGS="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${DATE}"
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "${LDFLAGS}" -o dist/${{ matrix.binary }} .
 
-          CGO_ENABLED=0 GOOS=linux  GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/patolake-linux-amd64 .
-          CGO_ENABLED=0 GOOS=linux  GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/patolake-linux-arm64 .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/patolake-darwin-amd64 .
-          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/patolake-darwin-arm64 .
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: dist/${{ matrix.binary }}
+          retention-days: 1
+
+  release:
+    needs: build-binary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: patolake-*
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lh dist/
 
       - name: Alpine smoke test (linux-amd64)
         run: |
@@ -62,6 +119,10 @@ jobs:
         run: |
           sha256sum patolake-* > checksums.txt
           cat checksums.txt
+
+      - name: Extract version
+        id: version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
         env:
