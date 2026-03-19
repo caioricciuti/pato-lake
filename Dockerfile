@@ -11,10 +11,10 @@ ENV PATOLAKE_VITE_MINIFY=true \
     PATOLAKE_VITE_REPORT_COMPRESSED=false
 RUN bun run build
 
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.25-bookworm AS go-builder
 WORKDIR /src
 
-RUN apk add --no-cache gcc g++ musl-dev
+RUN apt-get update && apt-get install -y --no-install-recommends g++ && rm -rf /var/lib/apt/lists/*
 
 ARG VERSION=dev
 ARG COMMIT=none
@@ -29,7 +29,7 @@ COPY . .
 COPY --from=ui-builder /src/ui/dist ./ui/dist
 
 RUN CGO_ENABLED=1 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags "-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" -o /out/patolake .
+    go build -trimpath -ldflags "-s -w -linkmode external -extldflags '-static' -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}" -o /out/patolake .
 
 FROM alpine:3.20 AS runtime
 RUN addgroup -S patolake && adduser -S -G patolake patolake \
